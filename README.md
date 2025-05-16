@@ -13,7 +13,7 @@ pip install timm==1.0.15 tensorboard
 
 ## Training
 
-To reproduce our results on ImageNet-100 with ViT-S , run the following commands: \
+To reproduce our results on ImageNet-100 with ViT-S_16x16_patch , run the following commands: 
 
 <details>
 <summary>
