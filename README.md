@@ -1,4 +1,4 @@
-a# [ViT_LNAblation]
+# [ViT_LNAblation]
 
 Experimental study conducting various ablations to the LayerNorm present in the ViT architecture.
 
@@ -100,5 +100,3 @@ sudo python main.py --data_set IMNET --data_path /teamspace/studios/this_studio/
 it_dys_adamw --dynamic_tanh true --batch_size 128 --model vit_small_patch16_224 --opt rmsprop
 ```
 </details>
-# ViT_LNAblation
-Experimental study conducting various ablations to the LayerNorm present in the ViT architecture.
