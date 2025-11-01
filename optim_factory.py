@@ -17,7 +17,7 @@ from timm.optim.nvnovograd import NvNovoGrad
 from timm.optim.rmsprop_tf import RMSpropTF
 from timm.optim.sgdp import SGDP
 from dynamic_tanh_new import DynamicTanh
-from dynamic_tanh_new import compute_activation_stats
+#from dynamic_tanh_new import compute_activation_stats
 
 import json
 import types
@@ -208,14 +208,14 @@ def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filt
 
     ##### this might not work
        # If using DynamicTanh layers, attach W&B logging hooks
-    from dynamic_tanh_new import compute_activation_stats
+
 
     for name, module in model.named_modules():
         if isinstance(module, DynamicTanh):
             # register forward hook
             def _hook(mod, inp, out, name=name):
 
-                stats = compute_activation_stats(out)
+                stats = module.compute_activation_stats(out)
                 _log_dyt_stats_to_wandb(name, stats)
             module.register_forward_hook(_hook)
 
@@ -233,7 +233,7 @@ def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filt
         for name, module in model.named_modules():
             if isinstance(module, DynamicTanh):
                 def hook_fn(module, input, output, name=name):
-                    stats = compute_activation_stats(module, input[0])
+                    stats = module.compute_activation_stats(module, input[0])
                     module._latest_stats = stats
                     print(f"[DynamicMonitor] {name} -> rank={stats['effective_rank']:.3f}, decay={stats['spectral_decay']:.3f}")
                 hooks.append(module.register_forward_hook(hook_fn))

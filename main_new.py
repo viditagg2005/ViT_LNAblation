@@ -32,7 +32,7 @@ from engine import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 
-from dynamic_tanh import convert_ln_to_dyt
+from dynamic_tanh_new import convert_ln_to_dyt
 from dynamic_sigmoid import convert_ln_to_dysg
 from dynamic_softsign import convert_ln_to_dyss
 from batch_norm import convert_ln_to_dynbn

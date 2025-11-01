@@ -192,3 +192,23 @@ def convert_ln_to_dyt(module):
     del module
     return module_output
 
+# expose a global callable for external modules
+def collect_dynamic_tanh_stats(mod: nn.Module, x: torch.Tensor) -> dict:
+    """
+    Convenience wrapper for use outside this file.
+    Calls compute_activation_stats() if available.
+    """
+    if isinstance(mod, DynamicTanh):
+        print("Collecting DynamicTanh activation stats.")
+        return mod.compute_activation_stats(x)
+    else:
+        print("Warning: Module does not support dynamic tanh stats collection.")
+        return {
+            "mean": None,
+            "std": None,
+            "skew": None,
+            "kurtosis": None,
+            "top_singular": None,
+            "effective_rank": None,
+            "spectral_decay": None
+        }

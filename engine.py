@@ -14,7 +14,7 @@ from timm.utils import accuracy, ModelEma
 import time
 import utils
 import os
-from dynamic_tanh_new import DynamicTanh, compute_activation_stats
+from dynamic_tanh_new import DynamicTanh, collect_dynamic_tanh_stats
 
 # # instrumentation: constants or config keys
 # # These are assumed to come via cfg or args; you can adjust naming if needed.
@@ -108,7 +108,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             class_acc = None
 
         ######        # Compute activation information metrics
-        activation_stats = compute_activation_stats(model, samples)
+        activation_stats = collect_dynamic_tanh_stats(model, samples)
         metric_logger.update(info_eff_rank=activation_stats["effective_rank"])
         metric_logger.update(info_singular_val=activation_stats["spectral_decay"])
 
