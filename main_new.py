@@ -214,28 +214,15 @@ def get_args_parser():
     parser.add_argument('--rms_norm', type = str2bool, default= False)
     parser.add_argument('--batch_norm', type = str2bool, default= False)
 
-
-    # New arguments can be added below this line 
-    parser.add_argument("--use_dyt", action="store_true",
-                    help="Use DynamicTanh instead of LayerNorm/RMSNorm (paper DyT).")
-    parser.add_argument("--dyt_mode", type=str, default="scalar",
-                        choices=["scalar", "per_channel", "per_token", "per_token_channel", "factorized"],
-                        help="DyT alpha parameterization mode.")
-    parser.add_argument("--dyt_init_alpha", type=float, default=1.0,
-                        help="Initial alpha value for DyT.")
-    parser.add_argument("--dyt_rank", type=int, default=8,
-                        help="Rank for factorized DyT mode.")
-    parser.add_argument("--dyt_max_len", type=int, default=256,
-                        help="Max sequence/patch length for token-aware DyT modes.")
-    parser.add_argument("--dyt_use_affine", action="store_true",
-                        help="Add post-tanh affine (gamma,beta) to DyT.")
-    parser.add_argument("--dyt_alpha_lr_scale", type=float, default=0.2,
-                        help="Scale of learning rate for alpha params (alpha_lr = base_lr * scale).")
-    parser.add_argument("--dyt_no_weight_decay_alpha", action="store_true",
-                        help="Place DyT alpha params in a no-weight-decay group.")
-    parser.add_argument("--dyt_squash", type=str, default="tanh",
-                        choices=["tanh", "softsign", "arctan", "clipped_linear"],
-                        help="Which squashing function to use inside DyT (default tanh).")
+    # Instrumentation parameters
+    parser.add_argument("--alpha_snapshot_interval", type=int, default=1000,
+                    help="interval (in steps) to snapshot DyT alpha params.")
+    parser.add_argument("--collect_acts", action="store_true",
+                    help="Whether to collect activations for info‐preservation analysis.")
+    parser.add_argument("--act_collect_max_samples", type=int, default=2048,
+                    help="Max number of samples to collect activations.")
+    parser.add_argument("--log_interval", type=int, default=50,
+                    help="Interval (in steps) to log step time and gradient flow stats.")
 
     return parser
 
@@ -323,26 +310,13 @@ def main(args):
             head_init_scale=args.head_init_scale,
         )
     elif "vit" in args.model:
-        model_kwargs = {}
-        if args.use_dyt:
-            model_kwargs.update({
-                "use_dynamic_tanh": True,
-                "dyt_mode": args.dyt_mode,
-                "dyt_init_alpha": args.dyt_init_alpha,
-                "dyt_rank": args.dyt_rank,
-                "dyt_max_len": args.dyt_max_len,
-                "dyt_use_affine": args.dyt_use_affine,
-                "dyt_squash": args.dyt_squash,
-            })
         model = create_model(
             args.model,
             pretrained=False,
             num_classes=args.nb_classes,
             global_pool='avg',
             drop_path_rate=args.drop_path,
-            **model_kwargs
         )
-        
     else:
         raise ValueError(f"Unrecognized model: {args.model}")
 ################################
