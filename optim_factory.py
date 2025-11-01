@@ -18,6 +18,7 @@ from timm.optim.rmsprop_tf import RMSpropTF
 from timm.optim.sgdp import SGDP
 
 import json
+import types
 
 try:
     from apex.optimizers import FusedNovoGrad, FusedAdam, FusedLAMB, FusedSGD
@@ -191,4 +192,69 @@ def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filt
         if opt_split[0] == 'lookahead':
             optimizer = Lookahead(optimizer)
 
+    return optimizer
+
+##################### Newly added fns. Use create_optimizer for default and build_optimizer for custom
+def is_dyt_alpha_param(name, module):
+    """
+    Heuristic: parameter names for DynamicTanh are often 'alpha', 'u', 'v', 'gamma', 'beta'
+    We prefer explicit detection by module class.
+    """
+    clsname = module.__class__.__name__
+    if clsname == "DynamicTanh":
+        return True
+    return False
+
+def build_optimizer(model, base_lr, weight_decay, args):
+    """
+    Build optimizer grouping dyT alpha params separately when requested.
+    """
+    # Collect params
+    decay_params = []
+    no_decay_params = []
+    alpha_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Try to detect DynamicTanh alpha params by traversing parent modules:
+        # get module owning this parameter by splitting name
+        # NOTE: this is a heuristic: adjust if your repo uses parameter name patterns
+        name_parts = name.split('.')
+        found_module = model
+        # traverse to module just before param
+        for p in name_parts[:-1]:
+            if hasattr(found_module, p):
+                found_module = getattr(found_module, p)
+            else:
+                # fallback: try named_modules lookup:
+                try:
+                    found_module = dict(model.named_modules()).get(".".join(name_parts[:-1]), found_module)
+                except Exception:
+                    pass
+                break
+        if found_module is not None and found_module.__class__.__name__ == "DynamicTanh":
+            # class-level detection: put alpha-like params into alpha_params
+            alpha_params.append(param)
+            continue
+
+        # default: weight decay / no weight decay split
+        if name.endswith(".bias") or len(param.shape) == 1:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups = [
+        {"params": decay_params, "weight_decay": weight_decay, "lr": base_lr},
+        {"params": no_decay_params, "weight_decay": 0.0, "lr": base_lr},
+    ]
+    # Add alpha param group if exists
+    if len(alpha_params) > 0:
+        alpha_lr = base_lr * getattr(args, "dyt_alpha_lr_scale", 0.2)
+        alpha_wd = 0.0 if getattr(args, "dyt_no_weight_decay_alpha", True) else weight_decay
+        param_groups.append({"params": alpha_params, "weight_decay": alpha_wd, "lr": alpha_lr})
+        print(f"[optim_factory] Added {len(alpha_params)} DyT alpha params with lr={alpha_lr}, wd={alpha_wd}")
+
+    # Create optimizer (AdamW assumed; change to repo default)
+    optimizer = torch.optim.AdamW(param_groups, lr=base_lr, betas=(0.9, 0.999), eps=1e-8)
     return optimizer

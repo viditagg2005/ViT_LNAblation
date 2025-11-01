@@ -13,6 +13,8 @@ from collections import defaultdict, deque
 import datetime
 import numpy as np
 from timm.utils import get_state_dict
+import json
+
 
 from pathlib import Path
 
@@ -504,3 +506,59 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
             print("With optim & sched!")
+
+
+#### Newly added helpers
+def save_json(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def save_tensor_dict(tensor_dict, path):
+    """
+    Save a dict of tensors (on CPU) with torch.save.
+    tensor_dict: {name: torch.Tensor}
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # ensure CPU
+    cpu_dict = {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in tensor_dict.items()}
+    torch.save(cpu_dict, path)
+
+def estimate_module_params_and_flops(module, sample_shape=None):
+    """
+    Ask module for param_and_flops if available; fallback to counting parameters.
+    sample_shape: optional (B,T,C) to estimate flops per batch
+    """
+    if hasattr(module, "param_and_flops"):
+        return module.param_and_flops(sample_shape)
+    # fallback
+    params = sum(p.numel() for p in module.parameters())
+    flops_per_element = 6  # rough tanh cost estimate
+    info = {"extra_params": params}
+    if sample_shape:
+        B, T, C = sample_shape
+        info["flops_total"] = B * T * C * flops_per_element
+        info["flops_per_element"] = flops_per_element
+    return info
+
+def perturb_activations_additive(x, sigma_ratio=0.1):
+    """
+    Add Gaussian noise to activations x with sigma = sigma_ratio * std(x).
+    """
+    std = x.detach().cpu().float().std().item()
+    sigma = sigma_ratio * (std + 1e-12)
+    noise = torch.randn_like(x) * sigma
+    return x + noise
+
+def perturb_activations_multiplicative(x, scale=2.0, channels=None):
+    """
+    Multiply selected channels by scale. channels: list/array of channel indices or None for all.
+    """
+    x = x.clone()
+    if channels is None:
+        return x * scale
+    mask = torch.ones(x.shape[-1], device=x.device)
+    mask[channels] = scale
+    # broadcast mask to last dim
+    view = [1] * (x.ndim - 1) + [-1]
+    return x * mask.view(*view)

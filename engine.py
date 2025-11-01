@@ -11,8 +11,41 @@ from typing import Iterable, Optional
 import torch
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
-
+import time
+from utils import save_json, save_tensor_dict, estimate_module_params_and_flops
 import utils
+import os
+
+#######################
+# Define a small function to walk the model and snapshot DynamicTanh modules
+def snapshot_all_alphas(model):
+    snapshots = {}
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "DynamicTanh":
+            try:
+                snapshots[name] = module.snapshot_alpha()
+            except Exception:
+                # fallback: try reading attributes alpha/u/v
+                d = {}
+                if hasattr(module, "alpha"):
+                    d["alpha"] = module.alpha.detach().cpu().tolist()
+                if hasattr(module, "u") and hasattr(module, "v"):
+                    d["u_mean"] = float(module.u.detach().cpu().mean())
+                    d["v_mean"] = float(module.v.detach().cpu().mean())
+                snapshots[name] = d
+    return snapshots
+
+# Register gradient monitors for all DyT modules (call at start of training)
+def attach_all_grad_monitors(model, grad_container):
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "DynamicTanh":
+            module.attach_gradient_monitor(name, grad_container)
+
+def remove_all_grad_monitors(model, grad_container):
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "DynamicTanh":
+            module.remove_gradient_monitor(name, grad_container)
+#######################
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -21,15 +54,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     wandb_logger=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_training_steps_per_epoch=None, update_freq=None, use_amp=False):
     model.train(True)
+    grad_container = {} ## newly added
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-
+    attach_all_grad_monitors(model, grad_container)
     optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        start = time.time() ## newly added to monitor time
+
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -127,7 +163,36 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             if use_amp:
                 wandb_logger._wandb.log({'Rank-0 Batch Wise/train_grad_norm': grad_norm}, commit=False)
             wandb_logger._wandb.log({'Rank-0 Batch Wise/global_train_step': it})
-            
+        ##########################################################################
+        # after step: log grad_container if you like (pop latest entries)
+        if step % log_interval == 0:
+            # gather summary
+            grad_summary = {}
+            for k, v in grad_container.items():
+                # for each module, we recorded lists of grads; read last entry
+                input_grad_norm = v["input_grad_norms"][-1] if len(v.get("input_grad_norms", []))>0 else None
+                output_grad_norm = v["output_grad_norms"][-1] if len(v.get("output_grad_norms", []))>0 else None
+                grad_summary[k] = {"in_grad": input_grad_norm, "out_grad": output_grad_norm}
+            # log grad_summary to TB or JSON
+            logger.log({f"grad_stats/step_{step}": grad_summary})
+
+        # optional: periodically snapshot alpha parameters (every N steps)
+        if step % alpha_snapshot_interval == 0:
+            alpha_snap = snapshot_all_alphas(model)
+            save_json(alpha_snap, os.path.join(output_dir, f"alpha_snapshot_step_{global_step}.json"))
+
+        # optional: estimate DyT param/flops overhead once per epoch
+        if step == 0 and hasattr(model, 'named_modules'):
+            dyt_costs = {}
+            for name, m in model.named_modules():
+                if m.__class__.__name__ == "DynamicTanh":
+                    info = estimate_module_params_and_flops(m, sample_shape=(batch_size, images.shape[1], images.shape[-1] if images.ndim==3 else m.hidden_dim if hasattr(m,'hidden_dim') else 1))
+                    dyt_costs[name] = info
+            save_json(dyt_costs, os.path.join(output_dir, f"dyt_costs_epoch_{epoch}.json"))
+
+    # remove monitors at end of epoch to avoid unexpected hooks surviving
+    remove_all_grad_monitors(model, grad_container)
+    ##########################################################################     
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
