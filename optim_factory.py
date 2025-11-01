@@ -21,6 +21,7 @@ from dynamic_tanh_new import compute_activation_stats
 
 import json
 import types
+import wandb
 
 try:
     from apex.optimizers import FusedNovoGrad, FusedAdam, FusedLAMB, FusedSGD
@@ -28,6 +29,17 @@ try:
 except ImportError:
     has_apex = False
 
+
+def _log_dyt_stats_to_wandb(module_name, stats, global_step=0):
+    """
+    Log DynamicTanh activation & compression stats to W&B.
+    """
+    wandb.log({
+        f"dyt/{module_name}/effective_rank": stats.get("effective_rank"),
+        f"dyt/{module_name}/top_singular": stats.get("top_singular",[None])[0]
+    })
+    #}, step=global_step)
+ 
 
 def get_num_layer_for_convnext(var_name):
     """
@@ -194,7 +206,20 @@ def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filt
         if opt_split[0] == 'lookahead':
             optimizer = Lookahead(optimizer)
 
+    ##### this might not work
+       # If using DynamicTanh layers, attach W&B logging hooks
+    from dynamic_tanh_new import compute_activation_stats
 
+    for name, module in model.named_modules():
+        if isinstance(module, DynamicTanh):
+            # register forward hook
+            def _hook(mod, inp, out, name=name):
+
+                stats = compute_activation_stats(out)
+                _log_dyt_stats_to_wandb(name, stats)
+            module.register_forward_hook(_hook)
+
+    #####
     
     ####### --- Dynamic Monitoring Hook Integration ---
     def attach_dynamic_hooks(model):
