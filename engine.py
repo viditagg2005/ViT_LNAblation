@@ -12,40 +12,15 @@ import torch
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 import time
-from utils import save_json, save_tensor_dict, estimate_module_params_and_flops
 import utils
 import os
+from dynamic_tanh_new import DynamicTanh, compute_activation_stats
 
-#######################
-# Define a small function to walk the model and snapshot DynamicTanh modules
-def snapshot_all_alphas(model):
-    snapshots = {}
-    for name, module in model.named_modules():
-        if module.__class__.__name__ == "DynamicTanh":
-            try:
-                snapshots[name] = module.snapshot_alpha()
-            except Exception:
-                # fallback: try reading attributes alpha/u/v
-                d = {}
-                if hasattr(module, "alpha"):
-                    d["alpha"] = module.alpha.detach().cpu().tolist()
-                if hasattr(module, "u") and hasattr(module, "v"):
-                    d["u_mean"] = float(module.u.detach().cpu().mean())
-                    d["v_mean"] = float(module.v.detach().cpu().mean())
-                snapshots[name] = d
-    return snapshots
+# # instrumentation: constants or config keys
+# # These are assumed to come via cfg or args; you can adjust naming if needed.
+# log_interval = getattr(__import__('sys').modules[__name__], 'log_interval', None)
+# alpha_snapshot_interval = getattr(__import__('sys').modules[__name__], 'alpha_snapshot_interval', None)
 
-# Register gradient monitors for all DyT modules (call at start of training)
-def attach_all_grad_monitors(model, grad_container):
-    for name, module in model.named_modules():
-        if module.__class__.__name__ == "DynamicTanh":
-            module.attach_gradient_monitor(name, grad_container)
-
-def remove_all_grad_monitors(model, grad_container):
-    for name, module in model.named_modules():
-        if module.__class__.__name__ == "DynamicTanh":
-            module.remove_gradient_monitor(name, grad_container)
-#######################
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -54,17 +29,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     wandb_logger=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_training_steps_per_epoch=None, update_freq=None, use_amp=False):
     model.train(True)
-    grad_container = {} ## newly added
+    #grad_container = {} ## newly added for gradient‐flow diagnostics
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-    attach_all_grad_monitors(model, grad_container)
+    total_compute_time = 0.0 # newly added
     optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        start = time.time() ## newly added to monitor time
+        
 
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
@@ -80,6 +55,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+
+        start_compute = time.time()
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
@@ -107,6 +84,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                                     update_grad=(data_iter_step + 1) % update_freq == 0)
             if (data_iter_step + 1) % update_freq == 0:
                 optimizer.zero_grad()
+                ######
+                # compute gradient flow statistics
+                total_norm = torch.norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))
+                metric_logger.update(grad_flow=total_norm.item())
+                ######
                 if model_ema is not None:
                     model_ema.update(model)
         else: # full precision
@@ -124,6 +106,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             class_acc = (output.max(-1)[-1] == targets).float().mean()
         else:
             class_acc = None
+
+        ######        # Compute activation information metrics
+        activation_stats = compute_activation_stats(model, samples)
+        metric_logger.update(info_eff_rank=activation_stats["effective_rank"])
+        metric_logger.update(info_singular_val=activation_stats["spectral_decay"])
+
+        total_compute_time += time.time() - start_compute
+    ######
         metric_logger.update(loss=loss_value)
         metric_logger.update(class_acc=class_acc)
         min_lr = 10.
@@ -162,41 +152,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 wandb_logger._wandb.log({'Rank-0 Batch Wise/train_class_acc': class_acc}, commit=False)
             if use_amp:
                 wandb_logger._wandb.log({'Rank-0 Batch Wise/train_grad_norm': grad_norm}, commit=False)
-            wandb_logger._wandb.log({'Rank-0 Batch Wise/global_train_step': it})
-        ##########################################################################
-        # after step: log grad_container if you like (pop latest entries)
-        if step % log_interval == 0:
-            # gather summary
-            grad_summary = {}
-            for k, v in grad_container.items():
-                # for each module, we recorded lists of grads; read last entry
-                input_grad_norm = v["input_grad_norms"][-1] if len(v.get("input_grad_norms", []))>0 else None
-                output_grad_norm = v["output_grad_norms"][-1] if len(v.get("output_grad_norms", []))>0 else None
-                grad_summary[k] = {"in_grad": input_grad_norm, "out_grad": output_grad_norm}
-            # log grad_summary to TB or JSON
-            logger.log({f"grad_stats/step_{step}": grad_summary})
+            wandb_logger._wandb.log({'Rank-0 Batch Wise/global_train_step': it})  
 
-        # optional: periodically snapshot alpha parameters (every N steps)
-        if step % alpha_snapshot_interval == 0:
-            alpha_snap = snapshot_all_alphas(model)
-            save_json(alpha_snap, os.path.join(output_dir, f"alpha_snapshot_step_{global_step}.json"))
+            ### Newly added for activation and gradient stats
+            wandb_logger._wandb.log({
+                'Rank-0 Batch Wise/info_effective_rank': activation_stats["effective_rank"],
+                'Rank-0 Batch Wise/info_spectral_decay': activation_stats["spectral_decay"],
+                'Rank-0 Batch Wise/grad_flow': total_norm.item(),
+                'Rank-0 Batch Wise/compute_time': time.time() - start_compute
+            }, commit=False)
 
-        # optional: estimate DyT param/flops overhead once per epoch
-        if step == 0 and hasattr(model, 'named_modules'):
-            dyt_costs = {}
-            for name, m in model.named_modules():
-                if m.__class__.__name__ == "DynamicTanh":
-                    info = estimate_module_params_and_flops(m, sample_shape=(batch_size, images.shape[1], images.shape[-1] if images.ndim==3 else m.hidden_dim if hasattr(m,'hidden_dim') else 1))
-                    dyt_costs[name] = info
-            save_json(dyt_costs, os.path.join(output_dir, f"dyt_costs_epoch_{epoch}.json"))
 
-    # remove monitors at end of epoch to avoid unexpected hooks surviving
-    remove_all_grad_monitors(model, grad_container)
-    ##########################################################################     
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+
+    avg_compute_time = total_compute_time / len(data_loader)
+    metric_logger.update(avg_compute_time=avg_compute_time)
+    print(f"Average compute time per batch: {avg_compute_time:.4f}s")
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
