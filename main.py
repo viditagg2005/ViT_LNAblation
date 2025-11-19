@@ -37,6 +37,10 @@ from dynamic_sigmoid import convert_ln_to_dysg
 from dynamic_softsign import convert_ln_to_dyss
 from batch_norm import convert_ln_to_dynbn
 from rms_norm import convert_ln_to_rms
+from dynamic_clipped_linear import convert_ln_to_dyclippedlinear
+from dynamic_arctan import convert_ln_to_dyatan
+from dynamic_gelu import convert_ln_to_dygeluclip
+from dynamic_rational import convert_ln_to_dyrational
 
 
 def str2bool(v):
@@ -211,6 +215,10 @@ def get_args_parser():
     parser.add_argument('--dynamic_tanh', type=str2bool, default=False)
     parser.add_argument('--dynamic_sigmoid', type=str2bool, default=False)
     parser.add_argument('--dynamic_softsign', type=str2bool, default=False)
+    parser.add_argument('--dynamic_clipped_linear', type=str2bool, default=False)
+    parser.add_argument('--dynamic_arctan', type=str2bool, default=False)
+    parser.add_argument('--dynamic_gelu', type=str2bool, default=False)
+    parser.add_argument('--dynamic_rational', type=str2bool, default=False)
     parser.add_argument('--rms_norm', type = str2bool, default= False)
     parser.add_argument('--batch_norm', type = str2bool, default= False)
 
@@ -322,6 +330,14 @@ def main(args):
         model = convert_ln_to_rms(model) ## change this to analogous function
     if args.batch_norm:
         model = convert_ln_to_dynbn(model) ## change this to analogous function
+    if args.dynamic_clipped_linear:
+        model = convert_ln_to_dyclippedlinear(model)
+    if args.dynamic_arctan:
+        model = convert_ln_to_dyatan(model)
+    if args.dynamic_gelu:
+        model = convert_ln_to_dygeluclip(model)
+    if args.dynamic_rational:
+        model = convert_ln_to_dyrational(model)
 ################################ 
     if args.finetune:
         if args.finetune.startswith('https'):
