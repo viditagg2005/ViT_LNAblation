@@ -68,21 +68,69 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         loss_value = loss.item()
 
-        # [ADD THIS BLOCK] --- Axis 1: Log Gradient Ratios (Cheap) ---
+        # --- [FIX] Comprehensive Axis 1 Logging ---
         if data_iter_step % print_freq == 0:
-            # Aggregate average ratio across all layers
+            # Initialize lists to hold values from all DyT layers
             ratios = []
+            alphas = []
+            grad_in = []
+            grad_out = []
+
             for m in model.modules():
-                if "DynamicTanh" in str(type(m)) and hasattr(m, 'stability_metrics'):
-                     r = m.stability_metrics.get('grad_norm_ratio', None)
-                     if r is not None: ratios.append(r)
+                if "DynamicTanh" in str(type(m)):
+                    # 1. Capture Alpha (The learnable parameter)
+                    if hasattr(m, 'alpha'):
+                        alphas.append(m.alpha.item())
+                    
+                    # 2. Capture Gradient Stats
+                    if hasattr(m, 'stability_metrics'):
+                         r = m.stability_metrics.get('grad_norm_ratio', None)
+                         g_in = m.stability_metrics.get('grad_in_norm', None)
+                         g_out = m.stability_metrics.get('grad_out_norm', None)
+                         
+                         if r is not None: ratios.append(r)
+                         if g_in is not None: grad_in.append(g_in)
+                         if g_out is not None: grad_out.append(g_out)
             
+            # Compute Averages
+            update_dict = {}
             if ratios:
-                avg_ratio = sum(ratios) / len(ratios)
-                # Update logger (assuming utils.MetricLogger structure)
+                update_dict['grad_ratio'] = sum(ratios) / len(ratios)
+            if alphas:
+                update_dict['alpha'] = sum(alphas) / len(alphas)
+            if grad_in:
+                update_dict['g_in'] = sum(grad_in) / len(grad_in)
+            if grad_out:
+                update_dict['g_out'] = sum(grad_out) / len(grad_out)
+
+            # Update the Loggers
+            if update_dict:
+                # Print to Terminal
+                metric_logger.update(**update_dict)
+                
+                # Log to TensorBoard/WandB
                 if log_writer is not None:
-                    log_writer.update(grad_ratio_avg=avg_ratio, head="perf")
-        # ------------------------------------------------------------
+                    for k, v in update_dict.items():
+                        log_writer.update({k: v}, head="perf")
+        # -----------------------------------------------------
+
+
+        # --- [FIX] Axis 1: Run Diagnostics (Rarely) ---
+        if data_iter_step > 0 and data_iter_step % 500 == 0:
+             print("\nRunning Stability Diagnostics... (this takes a moment)")
+             diag_input = samples[:4].to(device)
+             diag_stats = run_stability_diagnostics(model, diag_input)
+             
+             # Print specifically to console so you see it immediately
+             print(f"Diagnostic Stats (Step {data_iter_step}): {diag_stats}")
+
+             # Log to writers
+             if log_writer is not None:
+                 for k, v in diag_stats.items():
+                     log_writer.update({k: v}, head="diagnostics")
+             
+             model.train()
+        # -----------------------------------------------------
 
         if not math.isfinite(loss_value): # this could trigger if using AMP
             print("Loss is {}, stopping training".format(loss_value))
