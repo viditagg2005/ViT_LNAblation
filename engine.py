@@ -11,16 +11,9 @@ from typing import Iterable, Optional
 import torch
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
+from gradient_flow_diagnostics import run_stability_diagnostics
 import time
 import utils
-import os
-from dynamic_tanh_new import DynamicTanh, collect_dynamic_tanh_stats
-
-# # instrumentation: constants or config keys
-# # These are assumed to come via cfg or args; you can adjust naming if needed.
-# log_interval = getattr(__import__('sys').modules[__name__], 'log_interval', None)
-# alpha_snapshot_interval = getattr(__import__('sys').modules[__name__], 'alpha_snapshot_interval', None)
-
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -29,18 +22,24 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     wandb_logger=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_training_steps_per_epoch=None, update_freq=None, use_amp=False):
     model.train(True)
-    #grad_container = {} ## newly added for gradient‐flow diagnostics
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    
+    # [ADD THIS BLOCK] --- Setup Axis 1 Hooks ---
+    for m in model.modules():
+        if "DynamicTanh" in str(type(m)) and hasattr(m, 'register_stability_hooks'):
+            m.register_stability_hooks()
+    # -------------------------------------------
+    
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-    total_compute_time = 0.0 # newly added
+    # [ADD THIS LINE] --- Axis 2: Convergence Time ---
+    start_time = time.time()
+
     optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        
-
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -56,8 +55,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        start_compute = time.time()
-
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
@@ -70,6 +67,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             loss = criterion(output, targets)
 
         loss_value = loss.item()
+
+        # [ADD THIS BLOCK] --- Axis 1: Log Gradient Ratios (Cheap) ---
+        if data_iter_step % print_freq == 0:
+            # Aggregate average ratio across all layers
+            ratios = []
+            for m in model.modules():
+                if "DynamicTanh" in str(type(m)) and hasattr(m, 'stability_metrics'):
+                     r = m.stability_metrics.get('grad_norm_ratio', None)
+                     if r is not None: ratios.append(r)
+            
+            if ratios:
+                avg_ratio = sum(ratios) / len(ratios)
+                # Update logger (assuming utils.MetricLogger structure)
+                if log_writer is not None:
+                    log_writer.update(grad_ratio_avg=avg_ratio, head="perf")
+        # ------------------------------------------------------------
 
         if not math.isfinite(loss_value): # this could trigger if using AMP
             print("Loss is {}, stopping training".format(loss_value))
@@ -84,11 +97,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                                     update_grad=(data_iter_step + 1) % update_freq == 0)
             if (data_iter_step + 1) % update_freq == 0:
                 optimizer.zero_grad()
-                ######
-                # compute gradient flow statistics
-                total_norm = torch.norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))
-                metric_logger.update(grad_flow=total_norm.item())
-                ######
                 if model_ema is not None:
                     model_ema.update(model)
         else: # full precision
@@ -100,20 +108,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if model_ema is not None:
                     model_ema.update(model)
 
+        # [ADD THIS BLOCK] --- Axis 1: Run Expensive Diagnostics (Rarely) ---
+        # Run every 500 steps (adjust based on speed)
+        if data_iter_step > 0 and data_iter_step % 500 == 0:
+             # Use a small slice of samples to save time
+             diag_input = samples[:4].to(device)
+             diag_stats = run_stability_diagnostics(model, diag_input)
+             
+             if log_writer is not None:
+                 for k, v in diag_stats.items():
+                     log_writer.update(**{k: v}, head="diagnostics")
+             
+             model.train() # Ensure we return to train mode
+        # -------------------------------------------------------------------
+
         torch.cuda.synchronize()
 
         if mixup_fn is None:
             class_acc = (output.max(-1)[-1] == targets).float().mean()
         else:
             class_acc = None
-
-        ######        # Compute activation information metrics
-        activation_stats = collect_dynamic_tanh_stats(model, samples)
-        metric_logger.update(info_eff_rank=activation_stats["effective_rank"])
-        metric_logger.update(info_singular_val=activation_stats["spectral_decay"])
-
-        total_compute_time += time.time() - start_compute
-    ######
         metric_logger.update(loss=loss_value)
         metric_logger.update(class_acc=class_acc)
         min_lr = 10.
@@ -152,26 +166,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 wandb_logger._wandb.log({'Rank-0 Batch Wise/train_class_acc': class_acc}, commit=False)
             if use_amp:
                 wandb_logger._wandb.log({'Rank-0 Batch Wise/train_grad_norm': grad_norm}, commit=False)
-            wandb_logger._wandb.log({'Rank-0 Batch Wise/global_train_step': it})  
-
-            ### Newly added for activation and gradient stats
-            wandb_logger._wandb.log({
-                'Rank-0 Batch Wise/info_effective_rank': activation_stats["effective_rank"],
-                'Rank-0 Batch Wise/info_spectral_decay': activation_stats["spectral_decay"],
-                'Rank-0 Batch Wise/grad_flow': total_norm.item(),
-                'Rank-0 Batch Wise/compute_time': time.time() - start_compute
-            }, commit=False)
-
-
+            wandb_logger._wandb.log({'Rank-0 Batch Wise/global_train_step': it})
+            
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+
+    # [ADD THIS LINE] --- Axis 2: Log Total Epoch Time ---
+    total_time = time.time() - start_time
+    print(f"Epoch {epoch} time: {total_time:.2f}s")
+    
     print("Averaged stats:", metric_logger)
-
-    avg_compute_time = total_compute_time / len(data_loader)
-    metric_logger.update(avg_compute_time=avg_compute_time)
-    print(f"Average compute time per batch: {avg_compute_time:.4f}s")
-
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()

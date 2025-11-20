@@ -32,11 +32,15 @@ from engine import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 
-from dynamic_tanh_new import convert_ln_to_dyt
+from dynamic_tanh import convert_ln_to_dyt
 from dynamic_sigmoid import convert_ln_to_dysg
 from dynamic_softsign import convert_ln_to_dyss
 from batch_norm import convert_ln_to_dynbn
 from rms_norm import convert_ln_to_rms
+from dynamic_clipped_linear import convert_ln_to_dyclippedlinear
+from dynamic_arctan import convert_ln_to_dyatan
+from dynamic_gelu import convert_ln_to_dygeluclip
+from dynamic_rational import convert_ln_to_dyrational
 
 
 def str2bool(v):
@@ -211,18 +215,16 @@ def get_args_parser():
     parser.add_argument('--dynamic_tanh', type=str2bool, default=False)
     parser.add_argument('--dynamic_sigmoid', type=str2bool, default=False)
     parser.add_argument('--dynamic_softsign', type=str2bool, default=False)
+    parser.add_argument('--dynamic_clipped_linear', type=str2bool, default=False)
+    parser.add_argument('--dynamic_arctan', type=str2bool, default=False)
+    parser.add_argument('--dynamic_gelu', type=str2bool, default=False)
+    parser.add_argument('--dynamic_rational', type=str2bool, default=False)
     parser.add_argument('--rms_norm', type = str2bool, default= False)
     parser.add_argument('--batch_norm', type = str2bool, default= False)
 
     # Instrumentation parameters
-    parser.add_argument("--alpha_snapshot_interval", type=int, default=1000,
-                    help="interval (in steps) to snapshot DyT alpha params.")
-    parser.add_argument("--collect_acts", action="store_true",
-                    help="Whether to collect activations for info‐preservation analysis.")
-    parser.add_argument("--act_collect_max_samples", type=int, default=2048,
-                    help="Max number of samples to collect activations.")
-    parser.add_argument("--log_interval", type=int, default=50,
-                    help="Interval (in steps) to log step time and gradient flow stats.")
+    parser.add_argument('--transfer_freeze_half', action='store_true', 
+                        help='Freeze the bottom 50% of blocks for Information Flow analysis.')
 
     return parser
 
@@ -332,8 +334,44 @@ def main(args):
         model = convert_ln_to_rms(model) ## change this to analogous function
     if args.batch_norm:
         model = convert_ln_to_dynbn(model) ## change this to analogous function
+    if args.dynamic_clipped_linear:
+        model = convert_ln_to_dyclippedlinear(model)
+    if args.dynamic_arctan:
+        model = convert_ln_to_dyatan(model)
+    if args.dynamic_gelu:
+        model = convert_ln_to_dygeluclip(model)
+    if args.dynamic_rational:
+        model = convert_ln_to_dyrational(model)
 ################################ 
     if args.finetune:
+        
+        # [ADD THIS BLOCK] --- Axis 3: Deep Freeze Logic ---
+        if args.transfer_freeze_half:
+            print("n\n[Experiment] Enabling Deep Freeze (Bottom 50%) for Information Flow Test.\n")
+            
+            # 1. Freeze Patch Embeddings (Input Layer)
+            if hasattr(model, 'patch_embed'):
+                for param in model.patch_embed.parameters():
+                    param.requires_grad = False
+            
+            # 2. Freeze lower half of blocks
+            if hasattr(model, 'blocks'): # ViT style
+                num_blocks = len(model.blocks)
+                cutoff = num_blocks // 2
+                for i in range(cutoff):
+                    for param in model.blocks[i].parameters():
+                        param.requires_grad = False
+                print(f"Frozen blocks 0 to {cutoff-1} (Total {num_blocks}).")
+                
+            elif hasattr(model, 'stages'): # ConvNeXt style
+                num_stages = len(model.stages)
+                cutoff = num_stages // 2
+                for i in range(cutoff):
+                    for param in model.stages[i].parameters():
+                        param.requires_grad = False
+                print(f"Frozen stages 0 to {cutoff-1}.")
+        # --------------------------------------------------
+
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu', check_hash=True)
