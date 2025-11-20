@@ -32,7 +32,7 @@ from engine import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 
-from dynamic_tanh import convert_ln_to_dyt
+from dynamic_tanh_new import convert_ln_to_dyt
 from dynamic_sigmoid import convert_ln_to_dysg
 from dynamic_softsign import convert_ln_to_dyss
 from batch_norm import convert_ln_to_dynbn
@@ -174,7 +174,7 @@ def get_args_parser():
 
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
-    parser.add_argument('--auto_resume', type=str2bool, default=True)
+    parser.add_argument('--auto_resume', type=str2bool, default=False)
     parser.add_argument('--save_ckpt', type=str2bool, default=True)
     parser.add_argument('--save_ckpt_freq', default=1, type=int)
     parser.add_argument('--save_ckpt_num', default=3, type=int)

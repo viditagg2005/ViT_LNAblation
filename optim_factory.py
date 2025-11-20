@@ -16,12 +16,8 @@ from timm.optim.lookahead import Lookahead
 from timm.optim.nvnovograd import NvNovoGrad
 from timm.optim.rmsprop_tf import RMSpropTF
 from timm.optim.sgdp import SGDP
-from dynamic_tanh_new import DynamicTanh
-#from dynamic_tanh_new import compute_activation_stats
 
 import json
-import types
-import wandb
 
 try:
     from apex.optimizers import FusedNovoGrad, FusedAdam, FusedLAMB, FusedSGD
@@ -29,17 +25,6 @@ try:
 except ImportError:
     has_apex = False
 
-
-def _log_dyt_stats_to_wandb(module_name, stats, global_step=0):
-    """
-    Log DynamicTanh activation & compression stats to W&B.
-    """
-    wandb.log({
-        f"dyt/{module_name}/effective_rank": stats.get("effective_rank"),
-        f"dyt/{module_name}/top_singular": stats.get("top_singular",[None])[0]
-    })
-    #}, step=global_step)
- 
 
 def get_num_layer_for_convnext(var_name):
     """
@@ -205,43 +190,5 @@ def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filt
     if len(opt_split) > 1:
         if opt_split[0] == 'lookahead':
             optimizer = Lookahead(optimizer)
-
-    ##### this might not work
-       # If using DynamicTanh layers, attach W&B logging hooks
-
-
-    for name, module in model.named_modules():
-        if isinstance(module, DynamicTanh):
-            # register forward hook
-            def _hook(mod, inp, out, name=name):
-
-                stats = module.compute_activation_stats(out)
-                _log_dyt_stats_to_wandb(name, stats)
-            module.register_forward_hook(_hook)
-
-    #####
-    
-    ####### --- Dynamic Monitoring Hook Integration ---
-    def attach_dynamic_hooks(model):
-        """
-        Attaches forward and backward hooks to capture:
-          - Gradient flow norms
-          - Activation information efficiency
-          - Dynamic compression of activation states
-        """
-        hooks = []
-        for name, module in model.named_modules():
-            if isinstance(module, DynamicTanh):
-                def hook_fn(module, input, output, name=name):
-                    stats = module.compute_activation_stats(module, input[0])
-                    module._latest_stats = stats
-                    print(f"[DynamicMonitor] {name} -> rank={stats['effective_rank']:.3f}, decay={stats['spectral_decay']:.3f}")
-                hooks.append(module.register_forward_hook(hook_fn))
-        return hooks
-
-    # Attach dynamic monitoring hooks if DynamicTanh layers exist
-    if any(isinstance(m, DynamicTanh) for m in model.modules()):
-        attach_dynamic_hooks(model)
-    ########
 
     return optimizer

@@ -33,7 +33,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # -------------------------------------------
     
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 1
     # [ADD THIS LINE] --- Axis 2: Convergence Time ---
     start_time = time.time()
 
