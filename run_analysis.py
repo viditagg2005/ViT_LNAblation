@@ -19,11 +19,11 @@ def load_model(model_name, checkpoint_path, device):
     """Loads model architecture and weights."""
     # Create model structure (Use your repo's create_model if available)
     print(f"Creating model {model_name}...")
-    model = timm.create_model(model_name, pretrained=False)
+    model = timm.create_model(model_name, pretrained=False,num_classes = 100)
     
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading weights from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only = False)
         # Handle 'model' key if present (common in timm/deit)
         if 'model' in checkpoint:
             state_dict = checkpoint['model']
