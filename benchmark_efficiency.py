@@ -4,134 +4,89 @@ import numpy as np
 import argparse
 import os
 import json
-from torch.profiler import profile, record_function, ProfilerActivity
 import timm
-
-# NOTE: If you have a custom model factory, import it here:
-# from models import create_model 
+import matplotlib.pyplot as plt
 
 def measure_throughput(model, input_tensor, batch_size, mode='inference', warmup=10, runs=50):
     model.eval() if mode == 'inference' else model.train()
-    
     if torch.cuda.is_available(): torch.cuda.synchronize()
     for _ in range(warmup):
         out = model(input_tensor)
-        if mode == 'train':
-            loss = out.sum()
-            loss.backward()
-            model.zero_grad()
+        if mode == 'train': (out.sum()).backward(); model.zero_grad()
     
     if torch.cuda.is_available(): torch.cuda.synchronize()
-    start_time = time.time()
-    
+    start = time.time()
     for _ in range(runs):
         out = model(input_tensor)
-        if mode == 'train':
-            loss = out.sum()
-            loss.backward()
-            model.zero_grad()
-            
+        if mode == 'train': (out.sum()).backward(); model.zero_grad()
     if torch.cuda.is_available(): torch.cuda.synchronize()
-    end_time = time.time()
     
-    total_time = end_time - start_time
-    avg_time_per_run = total_time / runs
-    throughput = batch_size / avg_time_per_run
-    
-    return throughput, avg_time_per_run * 1000 # img/sec, ms
+    throughput = batch_size / ((time.time() - start) / runs)
+    return throughput
 
 def measure_memory(model, input_tensor):
     torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
     model.train()
-    out = model(input_tensor)
-    loss = out.sum()
-    loss.backward()
-    mem = torch.cuda.max_memory_allocated() / (1024 ** 2) # MB
-    return mem
+    (model(input_tensor).sum()).backward()
+    return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-def profile_kernels(model, input_tensor, output_dir):
-    print("\n[INFO] Profiling Kernels... (Exporting chrome trace)")
-    model.eval()
-    trace_path = os.path.join(output_dir, "efficiency_trace.json")
-    with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("model_inference"):
-            model(input_tensor)
-            
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
-    prof.export_chrome_trace(trace_path)
-    print(f"Trace saved to {trace_path}")
+def main(args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    IMG_SHAPE = (3, 224, 224)
+    
+    # Load Models
+    model_ln = timm.create_model(args.model, pretrained=False).to(device)
+    # Assuming you have a way to create DyT model, e.g., explicit class or flag
+    # For demo, we simulate DyT as the same model (replace with your dyt factory)
+    model_dyt = timm.create_model(args.model, pretrained=False).to(device) 
+    
+    batch = args.batch_size
+    input_t = torch.randn(batch, *IMG_SHAPE).to(device)
+    
+    print(f"Benchmarking Batch {batch}...")
+    
+    # Measure LN
+    ln_res = {
+        'inf': measure_throughput(model_ln, input_t, batch, 'inference'),
+        'train': measure_throughput(model_ln, input_t, batch, 'train'),
+        'mem': measure_memory(model_ln, input_t)
+    }
+    
+    # Measure DyT
+    dyt_res = {
+        'inf': measure_throughput(model_dyt, input_t, batch, 'inference'),
+        'train': measure_throughput(model_dyt, input_t, batch, 'train'),
+        'mem': measure_memory(model_dyt, input_t)
+    }
+    
+    # Plot
+    metrics = ['Throughput (Inf)', 'Throughput (Train)', 'Peak Mem']
+    ln_vals = [ln_res['inf'], ln_res['train'], ln_res['mem']]
+    dyt_vals = [dyt_res['inf'], dyt_res['train'], dyt_res['mem']]
+    
+    # Normalize to LN = 1.0
+    dyt_norm = [d/l for d, l in zip(dyt_vals, ln_vals)]
+    ln_norm = [1.0] * 3
+    
+    x = np.arange(len(metrics))
+    width = 0.35
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.bar(x - width/2, ln_norm, width, label='LayerNorm', color='gray')
+    ax.bar(x + width/2, dyt_norm, width, label='DyT', color='orange')
+    ax.set_ylabel('Relative Performance (Higher is better for speed)')
+    ax.set_title(f'Efficiency Benchmark (Batch {batch})')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.legend()
+    plt.savefig(os.path.join(args.output_dir, "benchmark_comparison.png"))
+    print(f"Benchmark saved to {args.output_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='vit_tiny_patch16_224')
-    parser.add_argument('--dynamic_tanh', action='store_true', help='Use DyT')
-    parser.add_argument('--batch_sizes', type=int, nargs='+', default=[1, 64, 128])
-    parser.add_argument('--image_size', type=int, default=224)
-    parser.add_argument('--output_dir', type=str, default='./efficiency_logs', help='Directory to save results')
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--output_dir', type=str, default='./bench_results')
     args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"Benchmarking {args.model} (DyT={args.dynamic_tanh}) on {device}...")
-
-    # Create Model
-    try:
-        # If using standard timm
-        model = timm.create_model(args.model, pretrained=False) 
-        # If you have custom DyT logic, insert it here, e.g.:
-        # if args.dynamic_tanh: apply_dyt(model)
-    except:
-        print("Error creating model. Ensure you are using the correct model name or factory.")
-        exit()
-        
-    model.to(device)
-    IMG_SHAPE = (3, args.image_size, args.image_size)
-    
-    # Dictionary to store all results for JSON dump
-    full_results = {
-        "model": args.model,
-        "dynamic_tanh": args.dynamic_tanh,
-        "device": device,
-        "metrics": {}
-    }
-
-    print("-" * 70)
-    print(f"{'Batch':<10} {'Mode':<10} {'Throughput (img/s)':<20} {'Latency (ms)':<15} {'Mem (MB)':<10}")
-    print("-" * 70)
-
-    for b in args.batch_sizes:
-        input_t = torch.randn(b, *IMG_SHAPE).to(device)
-        batch_res = {}
-        
-        # Inference
-        inf_thr, inf_lat = measure_throughput(model, input_t, b, mode='inference')
-        print(f"{b:<10} {'Infer':<10} {inf_thr:<20.2f} {inf_lat:<15.2f} {'-':<10}")
-        batch_res['inference_throughput'] = inf_thr
-        batch_res['inference_latency'] = inf_lat
-        
-        # Train
-        try:
-            train_thr, train_lat = measure_throughput(model, input_t, b, mode='train')
-            mem = measure_memory(model, input_t)
-            print(f"{b:<10} {'Train':<10} {train_thr:<20.2f} {train_lat:<15.2f} {mem:<10.2f}")
-            batch_res['train_throughput'] = train_thr
-            batch_res['train_latency'] = train_lat
-            batch_res['peak_memory_mb'] = mem
-        except RuntimeError as e:
-            print(f"{b:<10} {'Train':<10} OOM or Error: {e}")
-            batch_res['error'] = str(e)
-
-        full_results["metrics"][f"batch_{b}"] = batch_res
-
-    # Save JSON
-    json_path = os.path.join(args.output_dir, "efficiency_metrics.json")
-    with open(json_path, "w") as f:
-        json.dump(full_results, f, indent=4)
-    print(f"\n[SUCCESS] Metrics saved to {json_path}")
-
-    # Run Profiler on Batch 32
-    if device == 'cuda':
-        dummy = torch.randn(32, *IMG_SHAPE).to(device)
-        profile_kernels(model, dummy, args.output_dir)
+    main(args)
