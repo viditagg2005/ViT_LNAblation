@@ -2,3 +2,8 @@ __pycache__/
 datacifar-100-python/
 __pycache__/
 data/
+analysis_results/
+bench_results/
+output_dyt/
+output_ln/
+stats_bias_0.5_L5.csv

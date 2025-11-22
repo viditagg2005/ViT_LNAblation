@@ -61,7 +61,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Per GPU batch size')
-    parser.add_argument('--epochs', default=130, type=int)
+    parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--update_freq', default=1, type=int,
                         help='gradient accumulation steps')
 
@@ -174,7 +174,7 @@ def get_args_parser():
 
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
-    parser.add_argument('--auto_resume', type=str2bool, default=False)
+    parser.add_argument('--auto_resume', type=str2bool, default=True)
     parser.add_argument('--save_ckpt', type=str2bool, default=True)
     parser.add_argument('--save_ckpt_freq', default=1, type=int)
     parser.add_argument('--save_ckpt_num', default=3, type=int)
