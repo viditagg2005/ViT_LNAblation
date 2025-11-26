@@ -8,28 +8,67 @@ import seaborn as sns
 import pandas as pd
 import timm
 
-# Import your Analysis Suite class
+# Import Analysis Suite
 from info_preservation_analysis import AnalysisSuite
 
-# --- Loaders (Same as before) ---
-def load_model(model_name, checkpoint_path, device):
-    print(f"Creating model {model_name}...")
-    model = timm.create_model(model_name, pretrained=False, num_classes=100)
+# --- 1. Import Conversion Function ---
+try:
+    from dynamic_tanh_new import convert_ln_to_dyt
+except ImportError:
+    print("[ERROR] Could not import 'convert_ln_to_dyt' from 'dynamic_tanh_new.py'.")
+    exit(1)
+
+# --- 2. Robust Model Loading ---
+def load_model(model_name, ckpt_path, device, is_dyt=False):
+    print(f"Creating model {model_name} [{'DyT' if is_dyt else 'LN'}]...")
     
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Loading weights from {checkpoint_path}")
-        # weights_only=False to support numpy scalars often found in checkpoints
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    # Create Standard Model
+    try:
+        model = timm.create_model(model_name, pretrained=False, num_classes=100)
+    except:
+        print(f"Warning: {model_name} creation failed with num_classes=100, trying default.")
+        model = timm.create_model(model_name, pretrained=False) 
+
+    # Convert to DyT if requested
+    if is_dyt:
+        print(" -> Converting LayerNorm to DynamicTanh...")
+        model = convert_ln_to_dyt(model)
+
+    model.to(device)
+    
+    if ckpt_path and os.path.exists(ckpt_path):
+        print(f"Loading weights from {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        
         if 'model' in checkpoint:
             state_dict = checkpoint['model']
         else:
             state_dict = checkpoint
-        msg = model.load_state_dict(state_dict, strict=False)
+
+        # --- Fix Key Mismatches (Strict Prefix Check) ---
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k
+            
+            # Scenario A: Checkpoint has 'fc_norm...', Model expects 'norm...'
+            if k.startswith('fc_norm') and hasattr(model, 'norm'):
+                new_k = k.replace('fc_norm', 'norm', 1)
+                
+            # Scenario B: Checkpoint has 'norm...', Model expects 'fc_norm...'
+            # We explicitly check that it DOES NOT start with 'fc_norm' to avoid fc_fc_norm
+            elif k.startswith('norm') and not k.startswith('fc_norm') and hasattr(model, 'fc_norm'):
+                new_k = k.replace('norm', 'fc_norm', 1)
+            
+            new_state_dict[new_k] = v
+            
+        msg = model.load_state_dict(new_state_dict, strict=False)
         print(f"Load status: {msg}")
     else:
-        print(f"Warning: Checkpoint {checkpoint_path} not found! Using random init.")
-    return model.to(device)
+        print(f"Warning: Checkpoint {ckpt_path} not found! Using random init.")
+    
+    return model
 
+# --- 3. Data Loading ---
 def get_dataloader(data_path, batch_size=64):
     from torchvision import datasets, transforms
     from torch.utils.data import DataLoader
@@ -38,113 +77,132 @@ def get_dataloader(data_path, batch_size=64):
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    if not os.path.exists(data_path):
-        os.makedirs(data_path, exist_ok=True)
+    if not os.path.exists(data_path): os.makedirs(data_path, exist_ok=True)
     dataset = datasets.CIFAR100(root=data_path, train=False, download=True, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-# --- Plotting Logic ---
-def parse_training_logs(log_path):
+# --- 4. Plotting Logic ---
+def parse_training_logs(log_path, model_type):
     data = []
-    if not os.path.exists(log_path): return []
+    if not os.path.exists(log_path): 
+        print(f"Log not found: {log_path}")
+        return []
+    
     with open(log_path, 'r') as f:
         for line in f:
-            try: data.append(json.loads(line))
+            try: 
+                entry = json.loads(line)
+                epoch = entry['epoch']
+                step = entry['step']
+                abs_step = epoch * 1000 + step 
+                
+                for mod_name, metrics in entry['modules'].items():
+                    row = {
+                        'epoch': epoch, 
+                        'step': abs_step, 
+                        'module': mod_name,
+                        'model_type': model_type
+                    }
+                    row.update(metrics)
+                    data.append(row)
             except: pass
     return data
 
-def plot_training_dynamics(log_data, output_dir):
-    print("Generating Dynamics Plots (Gradient Flow & Alpha)...")
-    if not log_data:
-        print("No log data found.")
+def plot_training_dynamics(log_ln, log_dyt, output_dir):
+    print("\nGenerating Dynamics Plots...")
+    
+    records = []
+    if log_ln: records.extend(log_ln)
+    if log_dyt: records.extend(log_dyt)
+    
+    if not records:
+        print("No valid log data found to plot.")
         return
 
-    # Parse JSONL to DataFrame
-    records = []
-    for entry in log_data:
-        epoch = entry['epoch']
-        step = entry['step']
-        abs_step = epoch * 1000 + step 
-        
-        for mod_name, metrics in entry['modules'].items():
-            row = {'epoch': epoch, 'step': abs_step, 'module': mod_name}
-            row.update(metrics)
-            records.append(row)
-            
     df = pd.DataFrame(records)
-    if df.empty: return
-
-    # Helper: shorter names for legend
+    
+    # Filter for cleaner plots (only main blocks)
     df['layer_idx'] = df['module'].apply(lambda x: x.split('.')[1] if 'blocks' in x else 'other')
     df_blocks = df[df['layer_idx'] != 'other']
 
-    # 1. Gradient Ratio (Stability)
+    # --- Plot A: Gradient Ratio (Stability Comparison) ---
     if 'grad_ratio' in df.columns:
         plt.figure(figsize=(12, 6))
-        sns.lineplot(data=df_blocks, x='step', y='grad_ratio', hue='layer_idx', palette='viridis', legend=False)
-        plt.title("Gradient Norm Ratio (Out/In) vs Steps")
-        plt.ylim(0, 3) # Zoom in on stable region
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "dyn_grad_ratio.png"))
+        sns.lineplot(
+            data=df_blocks, 
+            x='epoch', 
+            y='grad_ratio', 
+            hue='model_type', 
+            style='model_type',
+            palette={'LayerNorm': 'blue', 'DyT': 'orange'}
+        )
+        plt.title("Average Gradient Norm Ratio (Out/In) vs Epoch")
+        plt.ylabel("Gradient Ratio (Ideal ~ 1.0)")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(output_dir, "dyn_grad_stability_compare.png"))
         plt.close()
+        print("Saved dyn_grad_stability_compare.png")
 
-    # 2. Alpha Evolution (Topology)
+    # --- Plot B: Alpha Evolution (DyT Only) ---
     if 'alpha' in df.columns:
-        plt.figure(figsize=(12, 6))
-        sns.lineplot(data=df_blocks, x='epoch', y='alpha', hue='layer_idx', palette='coolwarm')
-        plt.title("Alpha Parameter Evolution per Module")
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "dyn_alpha.png"))
-        plt.close()
+        df_dyt = df_blocks[df_blocks['model_type'] == 'DyT']
+        if not df_dyt.empty:
+            plt.figure(figsize=(12, 6))
+            sns.lineplot(data=df_dyt, x='epoch', y='alpha', hue='layer_idx', palette='coolwarm')
+            plt.title("DyT Alpha Parameter Evolution per Layer")
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(output_dir, "dyn_alpha_evolution.png"))
+            plt.close()
+            print("Saved dyn_alpha_evolution.png")
 
-    # 3. Gradient Norms (Raw)
-    if 'grad_in' in df.columns and 'grad_out' in df.columns:
+    # --- Plot C: Gradient Norms (Log Scale) ---
+    if 'grad_in' in df.columns:
         plt.figure(figsize=(12, 6))
-        # Plotting mean grad_in over time
-        sns.lineplot(data=df_blocks, x='epoch', y='grad_in', hue='layer_idx', palette='magma', legend=False)
-        plt.title("Gradient In-Norm vs Epoch")
+        sns.lineplot(
+            data=df_blocks, 
+            x='epoch', 
+            y='grad_in', 
+            hue='model_type',
+            palette={'LayerNorm': 'blue', 'DyT': 'orange'}
+        )
+        plt.title("Average Gradient Norm (Input) vs Epoch")
         plt.yscale('log')
-        plt.tight_layout()
+        plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(output_dir, "dyn_grad_norms.png"))
         plt.close()
-
-    print(f"Dynamics plots saved to {output_dir}")
+        print("Saved dyn_grad_norms.png")
 
 def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 1. Setup Data & Models
+    # 1. Setup Data
     dataloader = get_dataloader(args.data_path)
-    # We pass args.model (e.g., 'vit_tiny_patch16_224') so timm knows what to build.
-    print("Loading Baseline Model...")
-    model_ln = load_model(args.model, args.ckpt_ln, device)
-
-    print("Loading DyT Model...")
-    model_dyt = load_model(args.model, args.ckpt_dyt, device)
+    
+    # 2. Load Models (Pass is_dyt flag!)
+    model_ln = load_model(args.model, args.ckpt_ln, device, is_dyt=False)
+    model_dyt = load_model(args.model, args.ckpt_dyt, device, is_dyt=True)
     
     suite = AnalysisSuite(device=device)
-    results = {}
 
-    # --- Phase A: Static Rank Analysis (Computed ONCE on final weights) ---
-    print("\n[1/2] Computing Final Effective Rank Profile...")
+    # --- Phase 1: Effective Rank ---
+    print("\n[1/3] Computing Final Effective Rank Profile...")
     ranks_ln, names_ln = suite.compute_rank_profile(model_ln, dataloader)
     ranks_dyt, names_dyt = suite.compute_rank_profile(model_dyt, dataloader)
     
-    # Plot Rank Comparison
     plt.figure(figsize=(10, 6))
     plt.plot(ranks_ln, label='LayerNorm', marker='o')
     plt.plot(ranks_dyt, label='DyT', marker='x')
     plt.xlabel('Layer Depth')
     plt.ylabel('Effective Rank')
-    plt.title('Final Representation Rank (Higher = More Info)')
+    plt.title('Final Representation Rank (Information Preservation)')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(os.path.join(args.output_dir, "rank_comparison.png"))
     plt.close()
 
-    # --- Phase B: CKA Analysis ---
-    print("\n[2/2] Computing CKA Similarity...")
+    # --- Phase 2: CKA ---
+    print("\n[2/3] Computing CKA Similarity...")
     l1, l2, matrix = suite.compute_cka(model_ln, model_dyt, dataloader)
     
     plt.figure(figsize=(10, 8))
@@ -153,14 +211,15 @@ def main(args):
     plt.savefig(os.path.join(args.output_dir, "cka_heatmap.png"))
     plt.close()
     
-    # --- Phase C: Plot Training Dynamics (From Logs) ---
-    # We look for training_log.json in the folder where the checkpoint came from
-    log_path = os.path.join(os.path.dirname(args.ckpt_dyt), "training_log.json")
-    if os.path.exists(log_path):
-        log_data = parse_training_logs(log_path)
-        plot_training_dynamics(log_data, args.output_dir)
-    else:
-        print(f"No training log found at {log_path}, skipping dynamics plots.")
+    # --- Phase 3: Training Dynamics ---
+    print("\n[3/3] Parsing Training Logs...")
+    path_ln_log = os.path.join(os.path.dirname(args.ckpt_ln), "training_log.json")
+    path_dyt_log = os.path.join(os.path.dirname(args.ckpt_dyt), "training_log.json")
+    
+    log_data_ln = parse_training_logs(path_ln_log, "LayerNorm")
+    log_data_dyt = parse_training_logs(path_dyt_log, "DyT")
+    
+    plot_training_dynamics(log_data_ln, log_data_dyt, args.output_dir)
 
     print(f"\n[SUCCESS] All analysis outputs saved to {args.output_dir}")
 
@@ -168,9 +227,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='vit_tiny_patch16_224')
     parser.add_argument('--data_path', type=str, default='./data')
-    parser.add_argument('--ckpt_ln', type=str, required=True, help='Path to Baseline checkpoint')
-    parser.add_argument('--ckpt_dyt', type=str, required=True, help='Path to DyT checkpoint')
+    parser.add_argument('--ckpt_ln', type=str, required=True, help="Path to LN checkpoint")
+    parser.add_argument('--ckpt_dyt', type=str, required=True, help="Path to DyT checkpoint")
     parser.add_argument('--output_dir', type=str, default='./analysis_output')
     args = parser.parse_args()
-    
     main(args)
